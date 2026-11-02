@@ -173,6 +173,15 @@ int ObOpenAIUtils::ObOpenAIComplete::parse_output(common::ObIAllocator &allocato
     } else if (OB_FAIL(j_tree->seek(j_path, j_path.path_node_cnt(), false, false, hit))) {
     } else if (hit.size() == 0) {
       ret = OB_INVALID_DATA;
+    } else if (OB_ISNULL(hit[0])) {
+      ret = OB_INVALID_DATA;
+    } else if (hit[0]->json_type() != ObJsonNodeType::J_STRING) {
+      // the protocol carries the answer as a json string; a number/object
+      // here means a malformed response
+      ret = OB_INVALID_DATA;
+    } else if (static_cast<ObJsonString *>(hit[0])->get_str().empty()) {
+      // an empty answer is treated as an unusable response
+      ret = OB_INVALID_DATA;
     } else {
       result = hit[0];
     }

@@ -65,7 +65,10 @@ int ObExprAIComplete::calc_result_typeN(ObExprResType &type,
     if (OB_FAIL(ret)) {
     } else if (param_num == 3) {
       ObObjType in_type = types_stack[CONFIG_IDX].get_type();
-      if (OB_FAIL(ObJsonExprHelper::is_valid_for_json(types_stack, CONFIG_IDX, N_AI_COMPLETE))) {
+      if (ob_is_null(in_type)) {
+        // a NULL config means "no configuration": the call must proceed
+        // without one instead of failing json type validation
+      } else if (OB_FAIL(ObJsonExprHelper::is_valid_for_json(types_stack, CONFIG_IDX, N_AI_COMPLETE))) {
       } else if (ob_is_string_type(in_type) && types_stack[CONFIG_IDX].get_collation_type() != CS_TYPE_BINARY) {
         if (types_stack[CONFIG_IDX].get_charset_type() != CHARSET_UTF8MB4) {
           types_stack[CONFIG_IDX].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
@@ -132,7 +135,9 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
     }
 
     if (OB_FAIL(ret)) {
-    } else if (OB_NOT_NULL(arg_config)) {
+    } else if (OB_NOT_NULL(arg_config) && !arg_config->is_null()) {
+      // a NULL config value also means "no configuration", matching the
+      // NULL literal handled at type inference time
       if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, temp_allocator, *arg_config, expr.args_[2]->datum_meta_, expr.args_[2]->obj_meta_.has_lob_header(), config_str))) {
       } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_object_form_str(temp_allocator, config_str, config))) {
       }
