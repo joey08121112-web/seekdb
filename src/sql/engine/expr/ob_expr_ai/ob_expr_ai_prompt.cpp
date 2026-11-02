@@ -71,8 +71,9 @@ int ObExprAIPrompt::calc_result_typeN(ObExprResType &type,
       // same as template: text/blob args are materialized at eval time
       types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
     } else if (ob_is_json(types_stack[i].get_type())) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "json type is not supported");
+      // json array/object arguments keep their structure; only align the
+      // collation, same treatment as json_array()
+      types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
     } else {
       ret = OB_ERR_INVALID_TYPE_FOR_OP;
     }
@@ -111,21 +112,30 @@ int ObExprAIPrompt::eval_ai_prompt(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
   } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(tmp_allocator, args_array))) {
   } else {
     for (int64_t i = 1; i < expr.arg_cnt_ && OB_SUCC(ret); i++) {
-      ObDatum *datum = NULL;
       ObExpr *arg = expr.args_[i];
-      ObString arg_str;
-      ObJsonString *arg_json_str = NULL;
-      if (OB_FAIL(tmp_allocator.eval_arg(arg, ctx, datum))) {
-      } else if (ob_is_string_type(arg->datum_meta_.type_)) {
-        if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, tmp_allocator, *datum,
+      if (ob_is_string_type(arg->datum_meta_.type_)) {
+        ObDatum *datum = NULL;
+        ObString arg_str;
+        ObJsonString *arg_json_str = NULL;
+        if (OB_FAIL(tmp_allocator.eval_arg(arg, ctx, datum))) {
+        } else if (datum->is_null()) {
+          ret = OB_ERR_INVALID_TYPE_FOR_OP;
+        } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(ctx.exec_ctx_, tmp_allocator, *datum,
                 arg->datum_meta_, arg->obj_meta_.has_lob_header(), arg_str))) {
         } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(tmp_allocator, arg_str, arg_json_str))) {
         } else if (OB_FAIL(args_array->append(arg_json_str))) {
         }
       } else if (ob_is_json(arg->datum_meta_.type_)) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "json type is not supported");
-      } else if (datum->is_null()) {
+        // keep the json structure: append the parsed node itself instead of
+        // stringifying it, so json array/object args survive round trips
+        ObIJsonBase *j_val = NULL;
+        if (OB_FAIL(ObJsonExprHelper::get_json_val(expr, ctx, &tmp_allocator,
+                static_cast<uint16_t>(i), j_val))) {
+        } else if (OB_FAIL(args_array->array_append(j_val))) {
+        }
+      } else {
+        // any other type is already rejected by calc_result_typeN; keep the
+        // guard so a type/calc mismatch can never append garbage
         ret = OB_ERR_INVALID_TYPE_FOR_OP;
       }
     }
