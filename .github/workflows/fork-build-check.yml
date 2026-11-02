@@ -1,0 +1,12 @@
+name: Fork build check
+
+# Temporary competition-development helper: SeekDB CI is gated to the
+# oceanbase org (self-hosted runners), so feature branches on a fork can
+# never run it. This wrapper exposes the reusable Compile workflow via
+# workflow_dispatch to get a full build on GitHub-hosted runners.
+on:
+  workflow_dispatch:
+
+jobs:
+  ubuntu-build:
+    uses: ./.github/workflows/compile.yml
