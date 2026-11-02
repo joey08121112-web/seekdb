@@ -216,9 +216,47 @@ int ObOpenAIUtils::ObOpenAIEmbed::get_body(common::ObIAllocator &allocator,
   return ret;
 }
 
-int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator, 
+// a vector element extracted from an embeddings response must be a json
+// number; strings/objects/booleans cannot form a usable vector
+static bool is_vector_element_type(const ObJsonNodeType type)
+{
+  return type == ObJsonNodeType::J_INT || type == ObJsonNodeType::J_UINT
+      || type == ObJsonNodeType::J_DOUBLE || type == ObJsonNodeType::J_DECIMAL;
+}
+
+// an embedding payload must be a non-empty json array of numbers; anything
+// else means the service answered with an unusable vector and the whole
+// response must be rejected (OB_INVALID_DATA lets the caller surface the
+// raw http message to the user)
+static int append_validated_embedding(ObJsonArray *result_array, ObJsonNode *embedding)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(result_array) || OB_ISNULL(embedding)) {
+    ret = OB_INVALID_DATA;
+  } else if (embedding->json_type() != ObJsonNodeType::J_ARRAY) {
+    ret = OB_INVALID_DATA;
+  } else {
+    ObJsonArray *vector = static_cast<ObJsonArray *>(embedding);
+    if (vector->element_count() <= 0) {
+      ret = OB_INVALID_DATA;
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < vector->element_count(); i++) {
+      ObJsonNode *elem = vector->get_value(i);
+      if (OB_ISNULL(elem) || !is_vector_element_type(elem->json_type())) {
+        ret = OB_INVALID_DATA;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(result_array->append(vector))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
                                                common::ObJsonObject *http_response,
-                                               common::ObIJsonBase *&result) 
+                                               common::ObIJsonBase *&result)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(http_response)) {
@@ -228,6 +266,8 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
     ObJsonNode *data_node = nullptr;
     if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {
     } else if (OB_ISNULL(data_node = http_response->get_value("data"))) {
+      ret = OB_INVALID_DATA;
+    } else if (data_node->json_type() != ObJsonNodeType::J_ARRAY) {
       ret = OB_INVALID_DATA;
     } else {
       ObJsonArray *data_array = static_cast<ObJsonArray *>(data_node);
@@ -242,7 +282,7 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
           ObJsonNode *embedding = embedding_obj->get_value("embedding");
           if (OB_ISNULL(embedding)) {
             ret = OB_INVALID_DATA;
-          } else if (OB_FAIL(result_array->append(embedding))) {
+          } else if (OB_FAIL(append_validated_embedding(result_array, embedding))) {
           }
         }
       }
@@ -1475,13 +1515,18 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &content, Ob
         ObIJsonBase *j_base = result_array->get_value(i);
         if (OB_ISNULL(j_base)) {
           ret = OB_ERR_UNEXPECTED;
+        } else if (j_base->json_type() != ObJsonNodeType::J_ARRAY) {
+          // defense in depth: a provider parse_output must only emit vector
+          // arrays, but a broken response must fail here instead of letting
+          // the unchecked cast below corrupt results
+          ret = OB_INVALID_DATA;
         } else if (dimension > 0 && static_cast<ObJsonArray *>(j_base)->element_count() != dimension) {
           ret = OB_INVALID_ARGUMENT;
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, result dimension is not equal to dimension");
         } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, j_base, result_str))) {
         } else {
           results.push_back(result_str);
-        } 
+        }
       }
     }
   }
