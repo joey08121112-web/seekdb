@@ -77,9 +77,11 @@ int ObExprAIEmbed::calc_result_typeN(ObExprResType &type,
 // tail shared by the row-wise eval and the batch fallback: validates the
 // optional dimension argument, resolves the model endpoint and requests one
 // embedding. callers must have ruled out null model/content datums already.
+// content is by value: ObString is a shallow header and the model call takes
+// a mutable reference.
 static int eval_ai_embed_row(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res,
                              MultimodeAlloctor &temp_allocator, const ObString &model_id,
-                             const ObString &content, const ObDatum *arg_dim)
+                             ObString content, const ObDatum *arg_dim)
 {
   INIT_SUCC(ret);
   ObAIFuncExprInfo *info = nullptr;
