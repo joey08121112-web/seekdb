@@ -39,8 +39,79 @@ ObExprAIRerank::ObExprAIRerank(common::ObIAllocator &alloc)
 {
 }
 
-ObExprAIRerank::~ObExprAIRerank() 
+ObExprAIRerank::~ObExprAIRerank()
 {
+}
+
+// a relevance_score must be a json number; strings/booleans/objects cannot be
+// compared for ranking
+static bool is_score_number_type(const ObJsonNodeType type)
+{
+  return type == ObJsonNodeType::J_INT || type == ObJsonNodeType::J_UINT
+      || type == ObJsonNodeType::J_DOUBLE || type == ObJsonNodeType::J_DECIMAL;
+}
+
+// read the numeric score of an already-validated result entry; int / uint /
+// decimal scores are normalized to double so the merge never reinterprets a
+// non-double node as ObJsonDouble
+static int get_score_value(ObJsonObject *entry_obj, const ObString &score_key, double &score_value)
+{
+  INIT_SUCC(ret);
+  ObJsonNode *score_node = entry_obj->get_value(score_key);
+  if (OB_ISNULL(score_node)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai_rerank result entry has no score", K(ret));
+  } else if (!is_score_number_type(score_node->json_type())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai_rerank result entry score is not number", K(ret), K(score_node->json_type()));
+  } else if (OB_FAIL(score_node->to_double(score_value))) {
+    LOG_WARN("ai_rerank result entry score to double failed", K(ret));
+  }
+  return ret;
+}
+
+// validate every entry of a model rerank response before it is consumed:
+// {"index": <int in [0, index_bound)>, "relevance_score": <number>}; a
+// malformed entry would otherwise index out of bounds or misrank silently,
+// so reject the whole response with a readable error
+static int validate_rerank_result_entries(ObJsonArray *result_array, int64_t index_bound,
+                                          const ObString &index_key, const ObString &score_key)
+{
+  INIT_SUCC(ret);
+  if (OB_ISNULL(result_array)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai_rerank model result array is null", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < result_array->element_count(); i++) {
+      ObJsonNode *entry = result_array->get_value(i);
+      if (OB_ISNULL(entry)) {
+        ret = OB_INVALID_DATA;
+        LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank, model result entry is null");
+      } else if (entry->json_type() != ObJsonNodeType::J_OBJECT) {
+        ret = OB_INVALID_DATA;
+        LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank, model result entry is not object");
+      } else {
+        ObJsonObject *entry_obj = static_cast<ObJsonObject *>(entry);
+        ObJsonNode *index_node = entry_obj->get_value(index_key);
+        ObJsonNode *score_node = entry_obj->get_value(score_key);
+        if (OB_ISNULL(index_node) || OB_ISNULL(score_node)) {
+          ret = OB_INVALID_DATA;
+          LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank, model result entry misses index or relevance_score");
+        } else if (index_node->json_type() != ObJsonNodeType::J_INT) {
+          ret = OB_INVALID_DATA;
+          LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank, model result index is not integer");
+        } else if (static_cast<ObJsonInt *>(index_node)->value() < 0
+                   || static_cast<ObJsonInt *>(index_node)->value() >= index_bound) {
+          ret = OB_INVALID_DATA;
+          LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank, model result index is out of range");
+        } else if (!is_score_number_type(score_node->json_type())) {
+          ret = OB_INVALID_DATA;
+          LOG_USER_ERROR(OB_INVALID_DATA, "ai_rerank, model result relevance_score is not numeric");
+        }
+      }
+    }
+  }
+  return ret;
 }
 
 int ObExprAIRerank::calc_result_typeN(ObExprResType &type,
@@ -190,6 +261,9 @@ int ObExprAIRerank::eval_ai_rerank(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
           }
           if (OB_FAIL(construct_batch_document_array(temp_allocator, document_array, i, end_idx, batch_document_array))) {
           } else if (OB_FAIL(inner_eval_ai_rerank(temp_allocator, *info, *endpoint_info, header_array, query, batch_document_array, batch_result_array))) {
+          } else if (OB_FAIL(validate_rerank_result_entries(batch_result_array,
+                         static_cast<int64_t>(batch_document_array->element_count()),
+                         ObString(INDEX_KEY), ObString(SCORE_KEY)))) {
           } else if (OB_FAIL(batch_result_add_base(temp_allocator, batch_result_array, i))) {
           } else if (OB_FAIL(compact_json_array_by_key(temp_allocator, result_array, batch_result_array, score_key, compact_array))) {
           } else {
@@ -281,7 +355,10 @@ int ObExprAIRerank::sort_document_array_by_model_result(ObIAllocator &allocator,
 {
   INIT_SUCC(ret);
   ObJsonArray *sorted_document_array_obj = nullptr;
-  if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, sorted_document_array_obj))) {
+  if (OB_FAIL(validate_rerank_result_entries(model_result_array,
+                 static_cast<int64_t>(document_array->element_count()),
+                 ObString(INDEX_KEY), ObString(SCORE_KEY)))) {
+  } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, sorted_document_array_obj))) {
   } else {
     int64_t count = model_result_array->element_count();
     for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
@@ -290,16 +367,16 @@ int ObExprAIRerank::sort_document_array_by_model_result(ObIAllocator &allocator,
         ret = OB_ERR_UNEXPECTED;
       } else {
         ObJsonInt *index_value = static_cast<ObJsonInt *>(model_result_obj->get_value(INDEX_KEY));
-        ObJsonDouble *score_value = static_cast<ObJsonDouble *>(model_result_obj->get_value(SCORE_KEY));
+        ObJsonNode *score_value = model_result_obj->get_value(SCORE_KEY);
         if (OB_ISNULL(index_value) || OB_ISNULL(score_value)) {
           ret = OB_ERR_UNEXPECTED;
         } else {
           int64_t index = index_value->value();
-          ObJsonObject *origin_obj = static_cast<ObJsonObject *>(document_array->get_value(index));
+          ObJsonNode *origin_node = document_array->get_value(index);
           ObJsonObject *new_obj = nullptr;
-          if (OB_ISNULL(origin_obj)) {
+          if (OB_ISNULL(origin_node) || origin_node->json_type() != ObJsonNodeType::J_OBJECT) {
             ret = OB_ERR_UNEXPECTED;
-          } else if (OB_ISNULL(new_obj = static_cast<ObJsonObject *>(origin_obj->clone(&allocator, true)))) {
+          } else if (OB_ISNULL(new_obj = static_cast<ObJsonObject *>(origin_node->clone(&allocator, true)))) {
             ret = OB_ERR_UNEXPECTED;
           } else if (OB_FAIL(new_obj->add(MODEL_SCORE_KEY, score_value))) {
           } else if (OB_FAIL(sorted_document_array_obj->append(new_obj))) {
@@ -389,30 +466,28 @@ int ObExprAIRerank::compact_json_array_by_key(ObIAllocator &allocator, ObJsonArr
   } else {
     int64_t count1 = array1->element_count();
     int64_t count2 = array2->element_count();
-    int64_t min_count = count1 < count2 ? count1 : count2;
     int64_t i = 0;
     int64_t j = 0;
-    while (i < min_count && j < min_count) {
+    // standard two-way merge: both inputs are sorted by score desc, so the
+    // head with the larger score goes first; a tie keeps array1 so entries
+    // from earlier batches keep their original order (stable sort)
+    while (OB_SUCC(ret) && i < count1 && j < count2) {
       ObJsonObject *obj1 = static_cast<ObJsonObject *>(array1->get_value(i));
       ObJsonObject *obj2 = static_cast<ObJsonObject *>(array2->get_value(j));
+      double score1 = 0.0;
+      double score2 = 0.0;
       if (OB_ISNULL(obj1) || OB_ISNULL(obj2)) {
         ret = OB_ERR_UNEXPECTED;
-      } else {
-        ObJsonDouble *double1 = static_cast<ObJsonDouble *>(obj1->get_value(score_key));
-        ObJsonDouble *double2 = static_cast<ObJsonDouble *>(obj2->get_value(score_key));
-        if (OB_ISNULL(double1) || OB_ISNULL(double2)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else {
-          if (double1->value() > double2->value()) {
-            if (OB_FAIL(result_array->append(obj1))) {
-            }
-            i++;
-          } else {
-            if (OB_FAIL(result_array->append(obj2))) {
-            }
-            j++;
-          }
+      } else if (OB_FAIL(get_score_value(obj1, score_key, score1))) {
+      } else if (OB_FAIL(get_score_value(obj2, score_key, score2))) {
+      } else if (score1 >= score2) {
+        if (OB_FAIL(result_array->append(obj1))) {
         }
+        i++;
+      } else {
+        if (OB_FAIL(result_array->append(obj2))) {
+        }
+        j++;
       }
     }
     if (OB_SUCC(ret)) {
