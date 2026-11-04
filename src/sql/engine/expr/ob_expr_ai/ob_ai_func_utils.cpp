@@ -280,18 +280,60 @@ int ObOpenAIUtils::ObOpenAIEmbed::parse_output(common::ObIAllocator &allocator,
       ret = OB_INVALID_DATA;
     } else {
       ObJsonArray *data_array = static_cast<ObJsonArray *>(data_node);
-      ObJsonNode *embedding_node = nullptr;
-      for (int64_t i = 0; OB_SUCC(ret) && i < data_array->element_count(); i++) {
-        if (OB_ISNULL(embedding_node = data_array->get_value(i))) {
+      const int64_t count = data_array->element_count();
+      // a batched embeddings response answers several inputs at once and its
+      // items may arrive out of request order: each item's "index" names the
+      // request input it answers. resolve every slot up front and reject
+      // non-integer, duplicate or out-of-range indexes before appending
+      // anything, so a shuffled but well-formed response is restored to
+      // request order while a broken one fails as a whole.
+      ObArray<int64_t> slots;
+      ObArray<ObJsonNode *> embeddings;
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
+        ObJsonNode *item_node = data_array->get_value(i);
+        if (OB_ISNULL(item_node)) {
           ret = OB_INVALID_DATA;
-        } else if (embedding_node->json_type() != ObJsonNodeType::J_OBJECT) {
+        } else if (item_node->json_type() != ObJsonNodeType::J_OBJECT) {
           ret = OB_INVALID_DATA;
         } else {
-          ObJsonObject *embedding_obj = static_cast<ObJsonObject *>(embedding_node);
-          ObJsonNode *embedding = embedding_obj->get_value("embedding");
+          ObJsonObject *item_obj = static_cast<ObJsonObject *>(item_node);
+          ObJsonNode *embedding = item_obj->get_value("embedding");
+          ObJsonNode *index_node = item_obj->get_value("index");
+          int64_t slot = i;
           if (OB_ISNULL(embedding)) {
             ret = OB_INVALID_DATA;
-          } else if (OB_FAIL(append_validated_embedding(result_array, embedding))) {
+          } else if (OB_NOT_NULL(index_node)) {
+            // "index" is optional: an item without it keeps its positional slot
+            if (index_node->json_type() != ObJsonNodeType::J_INT) {
+              ret = OB_INVALID_DATA;
+            } else if ((slot = static_cast<ObJsonInt *>(index_node)->get_int()) < 0 || slot >= count) {
+              ret = OB_INVALID_DATA;
+            }
+          }
+          if (OB_SUCC(ret)) {
+            if (OB_FAIL(slots.push_back(slot))) {
+            } else if (OB_FAIL(embeddings.push_back(embedding))) {
+            }
+          }
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
+        for (int64_t j = i + 1; OB_SUCC(ret) && j < count; j++) {
+          if (slots[i] == slots[j]) {
+            // two items claim the same request position: the mapping is
+            // ambiguous, reject the whole response
+            ret = OB_INVALID_DATA;
+          }
+        }
+      }
+      // emit in request order: each position has exactly one item because
+      // the slots are distinct and within [0, count)
+      for (int64_t target = 0; OB_SUCC(ret) && target < count; target++) {
+        for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
+          if (slots[i] == target) {
+            if (OB_FAIL(append_validated_embedding(result_array, embeddings[i]))) {
+            }
+            break;
           }
         }
       }
